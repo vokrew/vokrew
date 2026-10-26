@@ -377,4 +377,7 @@ test("10. bridge: health open, pair flow gates /run, stamped chain over HTTP, ch
   });
   assert.equal(res.status, 204);
   assert.equal(res.headers.get("access-control-allow-origin"), "https://vokrew.com");
+  // Private Network Access: the public page needs this header to reach the
+  // loopback bridge from https://vokrew.com/app.
+  assert.equal(res.headers.get("access-control-allow-private-network"), "true");
 });

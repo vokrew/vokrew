@@ -392,6 +392,9 @@ export function createBridge({ home, config, lanes, ledger, version, resetToken 
           "access-control-allow-origin": origin,
           "access-control-allow-methods": "GET, POST, OPTIONS",
           "access-control-allow-headers": "Authorization, Content-Type",
+          // Private Network Access: a public https page (vokrew.com/app)
+          // fetching this loopback bridge needs this on the preflight.
+          "access-control-allow-private-network": "true",
           "access-control-max-age": "600",
           vary: "Origin",
         });
