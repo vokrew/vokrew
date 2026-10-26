@@ -26,6 +26,7 @@ npm link        # puts `vokrew` on your PATH
 ```sh
 vokrew run "add a retry with backoff to the fetch helper"
 vokrew chat
+vokrew serve
 vokrew budget
 vokrew lanes
 ```
@@ -54,6 +55,10 @@ vokrew chat --mock
 - **Workspace fence** — `run --workspace <dir>` stamps the run and puts the
   fence in the executor's instructions (a declared contract — see the
   honesty note under *Workspace fence* below).
+
+New in v2: **`vokrew serve`** — the localhost bridge the web face pairs to
+(pairing-code → Bearer token; `/run`, `/chat`, `/budget`, `/lanes`,
+`/crews` over the same core). See *Serve — the localhost bridge* below.
 
 ## Lanes
 
@@ -160,6 +165,71 @@ last turn), `/exit`.
 Chat runs on **surface=chat** in the ledger — a budget separate from coding,
 so chat can't silently eat the coding allowance (and vice versa).
 
+## Serve — the localhost bridge
+
+```sh
+vokrew serve [--port <n>] [--reset-token]
+```
+
+`vokrew serve` starts a small HTTP bridge on **127.0.0.1 only** (default
+port **7717**) so another face — first, the web app at vokrew.com/app — can
+drive the crew on *this* machine: the page is the remote control, your
+machine is the engine. It is the same core as the CLI, not a second
+implementation: `/run` runs the identical chain, `/chat` the identical
+chat turn, and every response carries the stamps.
+
+### Pairing
+
+On start, serve prints the URL and a **6-digit pairing code** (single-use,
+10-minute TTL; a fresh code is printed on the server console whenever one
+is consumed or expires):
+
+```
+Vokrew bridge listening on http://127.0.0.1:7717 (localhost only — not reachable from the internet)
+Pairing code: 483920  (single-use, expires in 10 minutes)
+```
+
+The client exchanges the code once:
+
+```sh
+curl -X POST http://127.0.0.1:7717/pair \
+  -H 'content-type: application/json' -d '{"code":"483920"}'
+# -> { "ok": true, "token": "…" }
+```
+
+The returned **Bearer token** is persisted in `~/.vokrew/bridge-token` and
+reused across restarts, until `vokrew serve --reset-token` throws it away.
+Wrong codes get a 401; after 5 wrong attempts, pairing locks for 5 minutes.
+
+### Endpoints (JSON in/out)
+
+| Route | Auth | What it does |
+| --- | --- | --- |
+| `GET /health` | none | `{ ok, version, surfaces: ["coding", "chat"] }` |
+| `POST /pair` | the code | `{ code }` → `{ token }` (see above) |
+| `POST /run` | Bearer | `{ task, crew?, workspace?, surface? }` → the full chain result: plan / work / review / verdict + stamps |
+| `POST /chat` | Bearer | `{ sessionId?, message, verify? }` → one chat turn; the server keeps per-session context in memory (last 6 turns); response carries the compact stamp; lands on surface=chat |
+| `GET /budget?surface=coding\|chat` | Bearer | The ledger view for that surface |
+| `GET /lanes` | Bearer | Configured lanes + health (same data as `vokrew lanes`) |
+| `GET /crews` | Bearer | Crew presets — names + role definitions (never the notes files' contents) |
+
+```sh
+curl -X POST http://127.0.0.1:7717/run \
+  -H "authorization: Bearer <token>" -H 'content-type: application/json' \
+  -d '{"task":"add a health endpoint to the relay"}'
+```
+
+CORS is deliberately narrow: only `https://vokrew.com` and
+`http(s)://localhost:*` origins are allowed (preflights included). Any
+other origin, and any request with a missing or bad token, gets a
+401/403 with a JSON error body — never an HTML error page.
+
+> **Honest limits:** the bridge binds localhost only — it is **not**
+> reachable from the internet and must never be. There is no TLS:
+> localhost-only is the design, and the pairing token is the credential.
+> Chat sessions are in-memory — restart the bridge and sessions start
+> fresh. (The ledger persists.)
+
 ## Workspace fence
 
 ```sh
@@ -224,17 +294,20 @@ Env overrides: `OPENROUTER_API_KEY`, `OLLAMA_HOST`, `VOKREW_HOME`.
 npm test
 ```
 
-Nine tests (node:test): stage order, failover with stamped attempts,
+Ten tests (node:test): stage order, failover with stamped attempts,
 cross-family reviewer selection, ledger increments + cap skipping, CHANGES
 surfacing, the openai-compatible provider against a local stub HTTP server
 (incl. failover on connection refused), crew preset instructions + stamps,
-a scripted two-turn chat session with ledger surface separation, and the
-workspace fence stamp + prompt line.
+a scripted two-turn chat session with ledger surface separation, the
+workspace fence stamp + prompt line, and the bridge over real HTTP on an
+ephemeral port (open health, the pairing flow gating `/run`, the stamped
+chain, chat landing on the chat surface, disallowed-Origin preflight
+rejected).
 
 ## What's not in yet
 
-- **Web chat face** (v1 Phase B, designed) — what lives at vokrew.com, and
-  how a browser face talks to your local lanes.
+- **Web chat face** (v1 Phase B, designed) — the UI at vokrew.com/app. The
+  bridge it pairs to (`vokrew serve`) is built — see *Serve* above.
 - **Conductor voice mode** (v1 Phase C, designed) — push-to-talk; speak to
   the whole crew at once.
 - **Tool execution** — file/shell tools with the workspace fence enforced

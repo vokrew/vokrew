@@ -19,6 +19,7 @@ import {
   increment,
 } from "../src/core.js";
 import { failingChat, openaiCompatibleHealth } from "../src/providers.js";
+import { createBridge, bridgeTokenPath } from "../src/serve.js";
 
 const LANES = [
   { id: "plan-a", provider: "mock", family: "alpha", tier: "local", model: "mock-1", cap: null },
@@ -265,4 +266,115 @@ test("9. workspace: run stamps the path and the executor prompt carries the fenc
     `WORKSPACE FENCE: your work is scoped to the workspace folder "${ws}". Anything outside that folder must be proposed, not assumed.`
   );
   assert.ok(formatRun(result).includes(`workspace=${ws}`));
+});
+
+// ---------------------------------------------------------------------------
+// v2 bridge test (10)
+// ---------------------------------------------------------------------------
+
+test("10. bridge: health open, pair flow gates /run, stamped chain over HTTP, chat lands on chat surface, bad origin rejected", async (t) => {
+  const home = tmpHome("vokrew-bridge-");
+  const mockLane = { id: "mock", provider: "mock", family: "mock", tier: "local", model: "mock-1", cap: null };
+  const config = { lanes: [mockLane], roles: { planner: ["mock"], executor: ["mock"], reviewer: ["mock"] } };
+  const ledger = loadLedger(home);
+  const bridge = createBridge({ home, config, lanes: buildLanes(config), ledger, version: "test-10" });
+  await new Promise((r) => bridge.server.listen(0, "127.0.0.1", r));
+  t.after(() => new Promise((r) => bridge.server.close(r)));
+  const base = `http://127.0.0.1:${bridge.server.address().port}`;
+  const code = bridge.newPairingCode();
+  const wrongCode = code === "000000" ? "999999" : "000000";
+  const post = (p, body, headers = {}) =>
+    fetch(`${base}${p}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+
+  // /health answers without auth.
+  let res = await fetch(`${base}/health`);
+  assert.equal(res.status, 200);
+  let body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.version, "test-10");
+  assert.deepEqual(body.surfaces, ["coding", "chat"]);
+
+  // /run without a token -> 401, JSON (never HTML).
+  res = await post("/run", { task: "demo task" });
+  assert.equal(res.status, 401);
+  assert.match(res.headers.get("content-type"), /application\/json/);
+  body = await res.json();
+  assert.equal(body.ok, false);
+
+  // Wrong pair code -> 401.
+  res = await post("/pair", { code: wrongCode });
+  assert.equal(res.status, 401);
+  body = await res.json();
+  assert.equal(body.ok, false);
+
+  // Correct code -> token, and the token is persisted for restarts.
+  res = await post("/pair", { code });
+  assert.equal(res.status, 200);
+  body = await res.json();
+  assert.equal(body.ok, true);
+  assert.ok(typeof body.token === "string" && body.token.length >= 16);
+  const token = body.token;
+  assert.equal(fs.readFileSync(bridgeTokenPath(home), "utf8").trim(), token);
+  // The consumed code is single-use: pairing again with it fails.
+  res = await post("/pair", { code });
+  assert.equal(res.status, 401);
+
+  const auth = { authorization: `Bearer ${token}` };
+
+  // /run with the token + mock lane returns the stamped chain.
+  res = await post("/run", { task: "demo task" }, auth);
+  assert.equal(res.status, 200);
+  body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.verdict, "APPROVED");
+  assert.equal(body.surface, "coding");
+  assert.deepEqual(body.stamps.map((s) => s.role), ["planner", "executor", "reviewer"]);
+  assert.ok(body.stamps.every((s) => s.lane === "mock" && typeof s.latencyMs === "number"));
+  assert.equal(body.stampLines.length, 3);
+  assert.match(body.stampLines[0], /^planner: lane=mock/);
+  assert.equal(countFor(loadLedger(home), "mock", "coding"), 3);
+
+  // /chat turn lands on surface=chat in the ledger.
+  res = await post("/chat", { message: "hello bridge" }, auth);
+  assert.equal(res.status, 200);
+  body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.surface, "chat");
+  assert.ok(body.sessionId);
+  assert.ok(body.text.length > 0);
+  assert.equal(body.stamps.length, 1); // light chain: executor only, no verify
+  assert.equal(countFor(loadLedger(home), "mock", "chat"), 1);
+  assert.equal(countFor(loadLedger(home), "mock", "coding"), 3); // unchanged
+
+  // /budget and /crews answer with the token (and crews never leak notes).
+  res = await fetch(`${base}/budget?surface=chat`, { headers: auth });
+  assert.equal(res.status, 200);
+  body = await res.json();
+  assert.equal(body.lanes.find((l) => l.id === "mock").used, 1);
+  res = await fetch(`${base}/crews`, { headers: auth });
+  assert.equal(res.status, 200);
+  body = await res.json();
+  assert.ok(Array.isArray(body.crews) && body.crews.some((c) => c.name === "default"));
+
+  // A disallowed Origin is rejected on preflight (and gets no CORS grant).
+  res = await fetch(`${base}/run`, {
+    method: "OPTIONS",
+    headers: { origin: "https://evil.example", "access-control-request-method": "POST" },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(res.headers.get("access-control-allow-origin"), null);
+  body = await res.json();
+  assert.equal(body.ok, false);
+
+  // An allowed Origin preflight is answered with that origin echoed.
+  res = await fetch(`${base}/run`, {
+    method: "OPTIONS",
+    headers: { origin: "https://vokrew.com", "access-control-request-method": "POST" },
+  });
+  assert.equal(res.status, 204);
+  assert.equal(res.headers.get("access-control-allow-origin"), "https://vokrew.com");
 });

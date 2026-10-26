@@ -18,6 +18,7 @@ import {
   loadCrewNotes,
 } from "./core.js";
 import { ollamaReachable, openaiCompatibleHealth } from "./providers.js";
+import { createBridge, BRIDGE_DEFAULT_PORT } from "./serve.js";
 
 const HELP = `vokrew — one prompt, a crew of AIs, checked before it ships.
 
@@ -25,6 +26,7 @@ Usage:
   vokrew run "<task>" [--crew <name>] [--workspace <dir>] [--remember]
                       [--surface coding|chat] [--mock]
   vokrew chat [--crew <name>] [--verify] [--mock]
+  vokrew serve [--port <n>] [--mock] [--reset-token]
   vokrew budget [--surface coding|chat]
   vokrew lanes
   vokrew --help
@@ -37,6 +39,12 @@ Commands:
            the executor answers; the reviewer runs only with --verify or
            when a message starts with "!check ". In-chat commands:
            /budget, /lanes, /stamps, /exit.
+  serve    Start the localhost bridge (127.0.0.1 only, default port 7717):
+           prints a single-use 6-digit pairing code; the web face at
+           vokrew.com/app exchanges it for a Bearer token, then drives
+           this machine's crew over /run, /chat, /budget, /lanes, /crews.
+           The token persists in ~/.vokrew/bridge-token across restarts
+           until --reset-token. Localhost only — never internet-facing.
   budget   Print today's quota ledger: usage per lane, daily caps, remaining.
   lanes    List configured lanes and their health.
 
@@ -55,6 +63,7 @@ Options:
 Config:  ~/.vokrew/config.json (created with defaults on first run)
 Crews:   ~/.vokrew/crews.json (named crew presets)
 Ledger:  ~/.vokrew/ledger.json (per-day counts per lane, per surface)
+Bridge:  ~/.vokrew/bridge-token (pairing token for "vokrew serve")
 Env:     OPENROUTER_API_KEY (BYOK lane), OLLAMA_HOST, VOKREW_HOME
 No account, no sign-up, no telemetry.`;
 
@@ -120,6 +129,48 @@ async function main(argv) {
 
   const config = loadConfig(home);
   const ledger = loadLedger(home);
+
+  if (cmd === "serve") {
+    const { values, bools } = parseArgs(rest, ["--port"], ["--mock", "--reset-token"]);
+    const port = values["--port"] ? Number(values["--port"]) : BRIDGE_DEFAULT_PORT;
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      console.error(`vokrew serve: invalid port "${values["--port"]}"`);
+      return 2;
+    }
+    let effective = config;
+    if (bools["--mock"]) ({ config: effective } = mockify(config, null));
+    const lanes = buildLanes(effective);
+    const bridge = createBridge({
+      home,
+      config: effective,
+      lanes,
+      ledger,
+      resetToken: !!bools["--reset-token"],
+      onPairingCode: (code) => console.log(`Pairing code: ${code}  (single-use, expires in 10 minutes)`),
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        bridge.server.once("error", reject);
+        bridge.server.listen(port, "127.0.0.1", resolve);
+      });
+    } catch (err) {
+      console.error(`vokrew serve: cannot listen on 127.0.0.1:${port} — ${err.message}`);
+      return 1;
+    }
+    const actualPort = bridge.server.address().port;
+    console.log(`Vokrew bridge listening on http://127.0.0.1:${actualPort} (localhost only — not reachable from the internet)`);
+    console.log(`Pair from the web face: POST /pair { "code": "<code below>" } -> Bearer token for /run, /chat, /budget, /lanes, /crews`);
+    bridge.newPairingCode();
+    // Stay alive until the server closes (Ctrl-C / SIGTERM).
+    await new Promise((resolve) => {
+      const shutdown = () => bridge.server.close(() => resolve());
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
+      bridge.server.once("close", resolve);
+    });
+    console.log("Vokrew bridge stopped.");
+    return 0;
+  }
 
   if (cmd === "budget") {
     const { values } = parseArgs(rest, ["--surface"], []);
