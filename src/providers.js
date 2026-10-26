@@ -1,8 +1,9 @@
 // Provider implementations for Vokrew lanes.
 //
 // A lane's `chat(prompt, ctx)` returns { text, model, latencyMs }.
-// ctx = { role, task }. Providers are deliberately tiny: native fetch only,
-// zero runtime dependencies.
+// ctx = { role, task, model } — ctx.model is a per-role model override from
+// a crew preset; providers use it in place of lane.model when present.
+// Providers are deliberately tiny: native fetch only, zero runtime deps.
 
 function timed(start) {
   return Math.max(0, Math.round(performance.now() - start));
@@ -26,20 +27,21 @@ async function fetchJson(url, opts, timeoutMs = 120000) {
 // --- ollama (local, first-class) -------------------------------------------
 export function ollamaChat(lane) {
   const base = (lane.baseUrl || "http://localhost:11434").replace(/\/$/, "");
-  return async (prompt) => {
+  return async (prompt, ctx = {}) => {
+    const model = ctx.model || lane.model;
     const start = performance.now();
     const data = await fetchJson(`${base}/api/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: lane.model,
+        model,
         stream: false,
         messages: [{ role: "user", content: prompt }],
       }),
     });
     const text = data?.message?.content ?? "";
     if (!text) throw new Error("ollama returned an empty response");
-    return { text, model: lane.model, latencyMs: timed(start) };
+    return { text, model, latencyMs: timed(start) };
   };
 }
 
@@ -57,9 +59,10 @@ export async function ollamaReachable(baseUrl = "http://localhost:11434", timeou
 
 // --- openrouter (BYOK) ------------------------------------------------------
 export function openrouterChat(lane) {
-  return async (prompt) => {
+  return async (prompt, ctx = {}) => {
     const key = process.env.OPENROUTER_API_KEY;
     if (!key) throw new Error("OPENROUTER_API_KEY is not set (BYOK lane unavailable)");
+    const model = ctx.model || lane.model;
     const start = performance.now();
     const data = await fetchJson("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -69,14 +72,68 @@ export function openrouterChat(lane) {
         "x-title": "vokrew",
       },
       body: JSON.stringify({
-        model: lane.model,
+        model,
         messages: [{ role: "user", content: prompt }],
       }),
     });
     const text = data?.choices?.[0]?.message?.content ?? "";
     if (!text) throw new Error("openrouter returned an empty response");
-    return { text, model: data?.model || lane.model, latencyMs: timed(start) };
+    return { text, model: data?.model || model, latencyMs: timed(start) };
   };
+}
+
+// --- openai-compatible (any OpenAI-shaped server: llama.cpp, llama-swap,
+//     LM Studio, vLLM, a hosted endpoint, ...) --------------------------------
+export function openaiCompatibleChat(lane) {
+  const base = (lane.baseUrl || "").replace(/\/$/, "");
+  return async (prompt, ctx = {}) => {
+    if (!base) throw new Error(`lane "${lane.id}" (openai-compatible) has no baseUrl`);
+    const model = ctx.model || lane.model;
+    const headers = { "content-type": "application/json" };
+    if (lane.apiKeyEnv) {
+      const key = process.env[lane.apiKeyEnv];
+      if (key) headers.authorization = `Bearer ${key}`;
+    }
+    const start = performance.now();
+    const data = await fetchJson(`${base}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const text = data?.choices?.[0]?.message?.content ?? "";
+    if (!text) throw new Error(`openai-compatible endpoint at ${base} returned an empty response`);
+    return { text, model: data?.model || model, latencyMs: timed(start) };
+  };
+}
+
+/**
+ * Health check for an openai-compatible lane: GET {baseUrl}/models.
+ * Falls back gracefully: a server that responds but doesn't support /models
+ * is reported as responded-but-unsupported rather than dead.
+ * Returns { responded, ok, modelCount }.
+ */
+export async function openaiCompatibleHealth(lane, timeoutMs = 800) {
+  const base = (lane.baseUrl || "").replace(/\/$/, "");
+  if (!base) return { responded: false, ok: false, modelCount: 0 };
+  const headers = {};
+  if (lane.apiKeyEnv && process.env[lane.apiKeyEnv]) {
+    headers.authorization = `Bearer ${process.env[lane.apiKeyEnv]}`;
+  }
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const res = await fetch(`${base}/models`, { headers, signal: ctrl.signal });
+    clearTimeout(t);
+    if (!res.ok) return { responded: true, ok: false, modelCount: 0 };
+    const data = await res.json().catch(() => null);
+    const modelCount = Array.isArray(data?.data) ? data.data.length : 0;
+    return { responded: true, ok: true, modelCount };
+  } catch {
+    return { responded: false, ok: false, modelCount: 0 };
+  }
 }
 
 // --- mock (deterministic, no network) ---------------------------------------
@@ -93,7 +150,7 @@ export function mockChat(lane) {
     } else {
       text = `Work: completed "${task}" following the plan (mock executor, family "${lane.family}").`;
     }
-    return { text, model: lane.model || "mock-1", latencyMs: timed(start) };
+    return { text, model: ctx.model || lane.model || "mock-1", latencyMs: timed(start) };
   };
 }
 
@@ -104,7 +161,12 @@ export function failingChat(message = "deliberate provider failure") {
   };
 }
 
-const IMPLS = { ollama: ollamaChat, openrouter: openrouterChat, mock: mockChat };
+const IMPLS = {
+  ollama: ollamaChat,
+  openrouter: openrouterChat,
+  "openai-compatible": openaiCompatibleChat,
+  mock: mockChat,
+};
 
 /**
  * Build runnable lanes from config.
