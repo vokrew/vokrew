@@ -325,8 +325,10 @@ test("10. bridge: health open, pair flow gates /run, stamped chain over HTTP, ch
 
   const auth = { authorization: `Bearer ${token}` };
 
-  // /run with the token + mock lane returns the stamped chain.
-  res = await post("/run", { task: "demo task" }, auth);
+  // /run?wait=1 with the token + mock lane returns the stamped chain
+  // (bare POST /run is the async 202 form since the run registry landed;
+  // ?wait=1 is the compat path with the exact pre-registry response).
+  res = await post("/run?wait=1", { task: "demo task" }, auth);
   assert.equal(res.status, 200);
   body = await res.json();
   assert.equal(body.ok, true);

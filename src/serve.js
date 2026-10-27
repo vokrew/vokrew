@@ -31,6 +31,8 @@ const LOCKOUT_MS = 5 * 60 * 1000; // after 5 wrong codes, pairing locks 5 min
 const MAX_WRONG_ATTEMPTS = 5;
 const MAX_BODY_BYTES = 1_000_000;
 const SESSION_HISTORY_CAP = 20;
+const RUNS_CAP = 50; // run registry keeps the last 50 records (in memory only)
+const CHAIN_ROLES = ["planner", "executor", "reviewer"]; // runChain stage order
 
 // Origins the web face may call from: the production site, and any
 // localhost port (local development of the face). No wildcards, ever.
@@ -175,6 +177,14 @@ export function createBridge({ home, config, lanes, ledger, version, resetToken 
   // Per-session chat context, in memory only: restart = fresh sessions.
   const sessions = new Map();
 
+  // Run registry (Phase 1 GAP-1/GAP-2): async POST /run records, in memory
+  // only like chat sessions — a bridge restart forgets run history by
+  // design. Insertion-ordered; pruned to the last RUNS_CAP records.
+  const runs = new Map();
+  function pruneRuns() {
+    while (runs.size > RUNS_CAP) runs.delete(runs.keys().next().value);
+  }
+
   function sendJson(res, status, obj, cors) {
     const body = JSON.stringify(obj);
     res.writeHead(status, {
@@ -219,7 +229,7 @@ export function createBridge({ home, config, lanes, ledger, version, resetToken 
     return sendJson(res, 200, { ok: true, token: state.token }, cors);
   }
 
-  async function handleRun(req, res, cors) {
+  async function handleRun(req, res, cors, url) {
     const body = await readJsonBody(req);
     const task = typeof body.task === "string" ? body.task.trim() : "";
     if (!task) return sendJson(res, 400, { ok: false, error: 'missing "task"' }, cors);
@@ -234,20 +244,19 @@ export function createBridge({ home, config, lanes, ledger, version, resetToken 
       return sendJson(res, 400, { ok: false, error: err.message }, cors);
     }
     const notes = crew?.name ? loadCrewNotes(home, crew.name) : "";
-    try {
-      const result = await runChain({
-        task,
-        surface,
-        config,
-        lanes,
-        ledger,
-        crew,
-        notes,
-        workspace: typeof body.workspace === "string" && body.workspace ? body.workspace : null,
-        home,
-      });
-      saveLedger(ledger);
-      return sendJson(
+    const args = {
+      task,
+      surface,
+      config,
+      lanes,
+      ledger,
+      crew,
+      notes,
+      workspace: typeof body.workspace === "string" && body.workspace ? body.workspace : null,
+      home,
+    };
+    const respondResult = (result) =>
+      sendJson(
         res,
         200,
         {
@@ -265,10 +274,106 @@ export function createBridge({ home, config, lanes, ledger, version, resetToken 
         },
         cors
       );
-    } catch (err) {
-      saveLedger(ledger);
-      return sendJson(res, 500, { ok: false, error: `run failed: ${err.message}` }, cors);
+
+    // Compat: ?wait=1 blocks and returns the exact pre-registry response.
+    if (url.searchParams.get("wait") === "1") {
+      try {
+        const result = await runChain(args);
+        saveLedger(ledger);
+        return respondResult(result);
+      } catch (err) {
+        saveLedger(ledger);
+        return sendJson(res, 500, { ok: false, error: `run failed: ${err.message}` }, cors);
+      }
     }
+
+    // Async (GAP-1): register the run, answer 202 immediately, and fill
+    // the record in as stages land (onStage) and when the chain settles.
+    // phase = the role currently executing: "planner" until the first
+    // stamp lands, then advanced by each onStage to the next role.
+    const record = {
+      id: crypto.randomUUID(),
+      task,
+      surface,
+      crew: crew?.name || null,
+      workspace: args.workspace,
+      state: "running",
+      phase: "planner",
+      startedAt: Date.now(),
+      finishedAt: null,
+      stages: [],
+      stamps: [],
+      stampLines: [],
+      compactStamps: [],
+      verdict: null,
+      crossFamily: null,
+      plan: null,
+      work: null,
+      review: null,
+      error: null,
+    };
+    runs.set(record.id, record);
+    pruneRuns();
+    runChain({
+      ...args,
+      onStage: (stage) => {
+        const stamp = stampsOf({ stages: [stage] }).stamps[0];
+        record.stages.push(stamp);
+        record.stamps.push(stamp);
+        const i = CHAIN_ROLES.indexOf(stage.role);
+        record.phase = i >= 0 && i + 1 < CHAIN_ROLES.length ? CHAIN_ROLES[i + 1] : null;
+      },
+    })
+      .then((result) => {
+        saveLedger(ledger);
+        const s = stampsOf(result);
+        record.state = "done";
+        record.phase = null;
+        record.finishedAt = Date.now();
+        record.verdict = result.verdict;
+        record.plan = result.plan;
+        record.work = result.work;
+        record.review = result.review;
+        record.crossFamily = result.reviewerFamily !== result.executorFamily;
+        record.stages = s.stamps;
+        record.stamps = s.stamps;
+        record.stampLines = s.stampLines;
+        record.compactStamps = s.compactStamps;
+      })
+      .catch((err) => {
+        saveLedger(ledger);
+        record.state = "failed";
+        record.phase = null;
+        record.finishedAt = Date.now();
+        record.error = `run failed: ${err.message}`;
+      });
+    return sendJson(res, 202, { ok: true, runId: record.id }, cors);
+  }
+
+  function handleRunGet(req, res, cors, id) {
+    const record = runs.get(id);
+    if (!record) return sendJson(res, 404, { ok: false, error: `no such run: ${id}` }, cors);
+    return sendJson(res, 200, { ok: true, run: record }, cors);
+  }
+
+  function handleRunList(req, res, cors, url) {
+    const parsed = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+    const limit = Number.isFinite(parsed) && parsed > 0 ? parsed : 20;
+    const summaries = [...runs.values()]
+      .reverse()
+      .slice(0, limit)
+      .map((r) => ({
+        id: r.id,
+        task: r.task,
+        crew: r.crew,
+        surface: r.surface,
+        state: r.state,
+        phase: r.phase,
+        startedAt: r.startedAt,
+        finishedAt: r.finishedAt,
+        verdict: r.verdict,
+      }));
+    return sendJson(res, 200, { ok: true, runs: summaries }, cors);
   }
 
   async function handleChat(req, res, cors) {
@@ -410,16 +515,19 @@ export function createBridge({ home, config, lanes, ledger, version, resetToken 
       }
       if (route === "POST /pair") return await handlePair(req, res, cors);
 
-      const protectedRoutes = ["POST /run", "POST /chat", "GET /budget", "GET /lanes", "GET /crews"];
-      if (protectedRoutes.includes(route)) {
+      const runIdMatch = req.method === "GET" ? /^\/runs\/([^/]+)$/.exec(url.pathname) : null;
+      const protectedRoutes = ["POST /run", "POST /chat", "GET /budget", "GET /lanes", "GET /crews", "GET /runs"];
+      if (protectedRoutes.includes(route) || runIdMatch) {
         if (!isAuthed(req)) {
           return sendJson(res, 401, { ok: false, error: state.token ? "missing or invalid bearer token" : "not paired yet — POST /pair with the code printed by `vokrew serve`" }, cors);
         }
-        if (route === "POST /run") return await handleRun(req, res, cors);
+        if (route === "POST /run") return await handleRun(req, res, cors, url);
         if (route === "POST /chat") return await handleChat(req, res, cors);
         if (route === "GET /budget") return handleBudget(req, res, cors, url);
         if (route === "GET /lanes") return await handleLanes(req, res, cors);
         if (route === "GET /crews") return handleCrews(req, res, cors);
+        if (route === "GET /runs") return handleRunList(req, res, cors, url);
+        if (runIdMatch) return handleRunGet(req, res, cors, runIdMatch[1]);
       }
 
       return sendJson(res, 404, { ok: false, error: `no such route: ${route}` }, cors);

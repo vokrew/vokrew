@@ -268,7 +268,8 @@ export function fenceLine(workspace) {
  * Run the chain: planner -> executor -> reviewer.
  * Optional: crew (resolved preset), notes (crew standing context for the
  * planner), workspace (fence), remember + home (reviewer appends a one-line
- * learning to the crew notes file).
+ * learning to the crew notes file), onStage (callback invoked with each
+ * stage object immediately after it completes; default no-op).
  */
 export async function runChain({
   task,
@@ -281,6 +282,7 @@ export async function runChain({
   workspace = null,
   remember = false,
   home = null,
+  onStage = () => {},
 }) {
   const lanesById = new Map(lanes.map((l) => [l.id, l]));
   const stages = [];
@@ -301,6 +303,7 @@ export async function runChain({
     prompt: plannerPrompt,
   });
   stages.push(planner);
+  onStage(planner);
   order.push("planner");
 
   const executorAgent = crewRole(crew, "executor");
@@ -318,6 +321,7 @@ export async function runChain({
     prompt: executorPrompt,
   });
   stages.push(executor);
+  onStage(executor);
   order.push("executor");
 
   const reviewerAgent = crewRole(crew, "reviewer");
@@ -336,6 +340,7 @@ export async function runChain({
     prompt: reviewerPrompt,
   });
   stages.push(reviewer);
+  onStage(reviewer);
   order.push("reviewer");
 
   const result = {
@@ -379,6 +384,7 @@ export async function runChatTurn({
   lanes,
   ledger,
   crew = null,
+  onStage = () => {},
 }) {
   const surface = "chat";
   const lanesById = new Map(lanes.map((l) => [l.id, l]));
@@ -407,6 +413,7 @@ export async function runChatTurn({
     prompt,
   });
   stages.push(executor);
+  onStage(executor);
 
   let review = null;
   let verdict = null;
@@ -426,6 +433,7 @@ export async function runChatTurn({
         `You are the reviewer. Judge the assistant's answer to the user's message. Reply starting with APPROVED or CHANGES, then brief notes.\n\nUser message: ${message}\n\nAnswer:\n${executor.text}`,
     });
     stages.push(reviewer);
+    onStage(reviewer);
     review = reviewer.text;
     verdict = parseVerdict(reviewer.text);
   }
